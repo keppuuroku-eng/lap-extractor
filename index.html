@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#5BA3D9">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>ラップグラフ数値抽出</title>
+<style>
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+html, body {
+  margin: 0; padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+  background: #F7F9FC; color: #1F2937;
+  font-size: 16px; line-height: 1.5;
+}
+
+header {
+  background: #fff;
+  border-bottom: 1px solid #E1E8ED;
+  padding: 14px 16px;
+  text-align: center;
+}
+header h1 { margin: 0; font-size: 17px; font-weight: 600; }
+
+main { max-width: 720px; margin: 0 auto; padding: 16px; }
+
+section {
+  background: #fff;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 14px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+}
+
+h2 {
+  margin: 0 0 8px 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: #5BA3D9;
+}
+
+.hint { color: #6B7280; font-size: 13px; margin: 0 0 12px 0; }
+
+/* Upload */
+.upload-area {
+  position: relative;
+  border: 2px dashed #5BA3D9;
+  border-radius: 12px;
+  padding: 32px 16px;
+  text-align: center;
+  background: #F7FAFD;
+}
+.upload-area input[type="file"] {
+  position: absolute; inset: 0;
+  opacity: 0; cursor: pointer;
+}
+.upload-icon { font-size: 40px; margin-bottom: 8px; }
+.upload-label {
+  font-size: 15px; font-weight: 600; color: #4090C9;
+  pointer-events: none;
+}
+.upload-sub { font-size: 12px; color: #6B7280; font-weight: 400; margin-top: 4px; }
+
+/* Image preview */
+.preview {
+  background: #FAFAFA;
+  border-radius: 8px;
+  margin-top: 12px;
+  overflow: hidden;
+}
+.preview canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 380px;
+  object-fit: contain;
+}
+
+/* Form */
+.form-row {
+  display: grid;
+  grid-template-columns: 1fr 90px auto;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.form-row label { font-size: 13px; font-weight: 500; }
+.form-row input {
+  font-size: 16px;
+  padding: 8px 10px;
+  border: 1px solid #E1E8ED;
+  border-radius: 6px;
+  text-align: right;
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+.form-row input:focus {
+  outline: none;
+  border-color: #5BA3D9;
+  box-shadow: 0 0 0 3px rgba(91,163,217,0.15);
+}
+.form-row .unit { font-size: 13px; color: #6B7280; }
+
+/* Buttons */
+.btn {
+  display: block;
+  width: 100%;
+  padding: 14px;
+  border: none;
+  border-radius: 10px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  background: #5BA3D9;
+  color: white;
+  margin-top: 8px;
+}
+.btn:active { background: #4090C9; }
+.btn:disabled { background: #ccc; cursor: not-allowed; }
+
+/* Result */
+textarea {
+  width: 100%;
+  min-height: 250px;
+  padding: 12px;
+  padding-bottom: 50px;
+  border: 1px solid #E1E8ED;
+  border-radius: 8px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 15px;
+  line-height: 1.7;
+  resize: vertical;
+}
+.result-output { position: relative; }
+.btn-copy {
+  position: absolute;
+  bottom: 10px; right: 10px;
+  padding: 8px 14px;
+  background: #5BA3D9;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn-copy:active { background: #4090C9; }
+
+.hidden { display: none !important; }
+
+/* Status box */
+#status {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #6B7280;
+}
+.error { color: #EF4444; }
+.success { color: #10B981; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ラップグラフ数値抽出</h1>
+</header>
+
+<main>
+
+  <!-- 1. 画像選択 -->
+  <section>
+    <h2>① 画像を選択</h2>
+    <p class="hint">グラフのスクリーンショットを選んでください（範囲指定はスマホで事前にトリミング済みのものを推奨）</p>
+    <div class="upload-area">
+      <input type="file" id="fileInput" accept="image/*">
+      <div class="upload-icon">📷</div>
+      <div class="upload-label">タップして画像を選ぶ</div>
+      <div class="upload-sub">カメラロール / ファイル</div>
+    </div>
+    <div id="status"></div>
+    <div class="preview hidden" id="previewBox">
+      <canvas id="previewCanvas"></canvas>
+    </div>
+  </section>
+
+  <!-- 2. パラメータ設定 -->
+  <section id="paramSection" class="hidden">
+    <h2>② 値を設定</h2>
+    <p class="hint">グラフのY軸の値を入力してください</p>
+    <div class="form-row">
+      <label>Y軸 一番上の値</label>
+      <input type="number" id="topValue" step="0.1" value="10" inputmode="decimal">
+      <span class="unit">秒</span>
+    </div>
+    <div class="form-row">
+      <label>Y軸 一番下の値</label>
+      <input type="number" id="bottomValue" step="0.1" value="14" inputmode="decimal">
+      <span class="unit">秒</span>
+    </div>
+    <div class="form-row">
+      <label>X軸の点の数</label>
+      <input type="number" id="pointCount" step="1" min="2" max="50" value="16" inputmode="numeric">
+      <span class="unit">個</span>
+    </div>
+    <div class="form-row">
+      <label>X軸の区間幅</label>
+      <input type="number" id="intervalWidth" step="50" value="200" inputmode="numeric">
+      <span class="unit">m</span>
+    </div>
+    <button class="btn" id="btnExtract">抽出する</button>
+  </section>
+
+  <!-- 3. 結果 -->
+  <section id="resultSection" class="hidden">
+    <h2>③ 抽出結果</h2>
+    <div class="preview">
+      <canvas id="resultCanvas"></canvas>
+    </div>
+    <div class="result-output" style="margin-top: 12px;">
+      <textarea id="resultText" readonly></textarea>
+      <button class="btn-copy" id="btnCopy">📋 コピー</button>
+    </div>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
