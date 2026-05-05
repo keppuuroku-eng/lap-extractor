@@ -18,6 +18,7 @@ if ('serviceWorker' in navigator) {
 const state = {
   imgEl: null,        // 元画像 HTMLImageElement
   detected: {},       // gridYTop, gridYBottom など
+  calibration: {},    // 編集機能用にユーザー入力値を保存
   results: [],
 };
 
@@ -172,6 +173,8 @@ document.getElementById('btnExtract').addEventListener('click', () => {
   }
 
   try {
+    // 編集機能用に値を保存
+    state.calibration = { topValue, bottomValue, pointCount, intervalWidth };
     extractPoints(topValue, bottomValue, pointCount, intervalWidth);
     renderResult();
     document.getElementById('resultSection').classList.remove('hidden');
@@ -242,26 +245,25 @@ function extractPoints(topValue, bottomValue, pointCount, intervalWidth) {
     throw new Error('点が見つかりませんでした (検出数: ' + bestN + ')。画像のトリミングを確認してください');
   }
 
-  // === 4. erosion 後の連結成分の中心を「点」として使う ===
-  // 端の点は erosion で消えていることがあるので、元マスクの連結成分で復元する
-  const erodedComps = getSquareComponents(bestEroded, W, H, 5);
-  // 元マスクのラベル
-  const origLabels = labelComponents(mask, W, H);
-  const seenOrig = new Set();
-  const points = [];
-  for (const ec of erodedComps) {
-    const cx = Math.round(ec.cx);
-    const cy = Math.round(ec.cy);
-    const origLabel = origLabels[cy * W + cx];
-    if (origLabel === 0 || !seenOrig.has(origLabel)) {
-      seenOrig.add(origLabel);
-      points.push({ x: ec.cx, y: ec.cy });
-    } else {
-      // 元マスクの同じ成分内に複数のerosion成分がある場合 (点が線でつながっている場合)
-      // → erosion後の中心位置をそのまま採用
-      points.push({ x: ec.cx, y: ec.cy });
-    }
+  // === 4. erosion + 少し小さい dilation で点を再構築 ===
+  // dilation サイズを erosion より 1 小さくすることで、線が完全に復活せず、
+  // 端の点も含めて適切に再現できる
+  let finalMask;
+  if (bestEr === 0) {
+    finalMask = mask;
+  } else {
+    const eroded = erode(mask, W, H, bestEr);
+    const dilateR = Math.max(1, bestEr - 1);
+    finalMask = dilate(eroded, W, H, dilateR);
   }
+
+  const finalComps = getSquareComponents(finalMask, W, H, 10);
+  if (finalComps.length === 0) {
+    throw new Error('点が見つかりませんでした');
+  }
+  // クラスタフィルタ (中央値 ±50%)
+  const points = getDominantCluster(finalComps, 0.5)
+    .map(c => ({ x: c.cx, y: c.cy }));
 
   console.log('Final points:', points.length);
 
@@ -495,26 +497,62 @@ function labelComponents(mask, W, H) {
   return labels;
 }
 
-// =========== 結果描画 ===========
+// =========== 結果描画 + 編集機能 ===========
+// 編集モードの状態
+const editState = {
+  scale: 1,
+  radius: 10,
+  fontSize: 13,
+  // ドラッグ管理
+  dragIdx: -1,        // ドラッグ中の点のインデックス (-1 なら無し)
+  pointerDownPt: null, // タッチ/マウスダウン時の座標
+  pointerDownIdx: -1,  // ダウン時にヒットした点のインデックス
+  moved: false,        // ダウン後、移動したか
+  setupDone: false,    // イベントハンドラ設置済みフラグ
+};
+
 function renderResult() {
   const img = state.imgEl;
   const canvas = document.getElementById('resultCanvas');
   canvas.width = img.naturalWidth;
   canvas.height = img.naturalHeight;
+
+  // 画像サイズに応じてサイズ調整
+  editState.scale = Math.max(1, Math.min(canvas.width, canvas.height) / 400);
+  editState.radius = 10 * editState.scale;
+  editState.fontSize = Math.max(11, Math.round(13 * editState.scale));
+
+  redrawResult();
+
+  // 初回のみイベントハンドラを設置
+  if (!editState.setupDone) {
+    setupEditHandlers(canvas);
+    editState.setupDone = true;
+  }
+}
+
+function redrawResult() {
+  const img = state.imgEl;
+  const canvas = document.getElementById('resultCanvas');
   const ctx = canvas.getContext('2d');
   ctx.drawImage(img, 0, 0);
 
-  // 画像サイズに応じてサイズ調整
-  const scale = Math.max(1, Math.min(canvas.width, canvas.height) / 400);
-  const radius = 10 * scale;
-  const fontSize = Math.max(11, Math.round(13 * scale));
+  const radius = editState.radius;
+  const fontSize = editState.fontSize;
+  const scale = editState.scale;
 
-  state.results.forEach(p => {
+  state.results.forEach((p, idx) => {
+    // ドラッグ中の点はハイライト
+    const isDragging = idx === editState.dragIdx;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
-    ctx.strokeStyle = '#EF4444';
+    ctx.arc(p.x, p.y, isDragging ? radius * 1.3 : radius, 0, Math.PI * 2);
+    ctx.strokeStyle = isDragging ? '#10B981' : '#EF4444';
     ctx.lineWidth = Math.max(2, 2 * scale);
     ctx.stroke();
+    if (isDragging) {
+      ctx.fillStyle = 'rgba(16, 185, 129, 0.2)';
+      ctx.fill();
+    }
 
     const label = p.sec.toFixed(1);
     ctx.font = 'bold ' + fontSize + 'px sans-serif';
@@ -527,10 +565,155 @@ function renderResult() {
     ctx.textAlign = 'left';
   });
 
+  // テキスト出力を更新
   const lines = state.results.map(p =>
     `・${p.start}-${p.end}：${p.sec.toFixed(1)}`
   );
   document.getElementById('resultText').value = lines.join('\n');
+}
+
+/**
+ * Y座標を秒数に変換 (再計算用)
+ */
+function yToSecValue(y) {
+  const yTop = state.detected.gridYTop;
+  const yBot = state.detected.gridYBottom;
+  const vTop = state.calibration.topValue;
+  const vBot = state.calibration.bottomValue;
+  return vTop + (y - yTop) / (yBot - yTop) * (vBot - vTop);
+}
+
+/**
+ * 結果配列をX順にソートし、start/end/sec を再計算
+ */
+function recomputeResults() {
+  state.results.sort((a, b) => a.x - b.x);
+  const intervalWidth = state.calibration.intervalWidth;
+  state.results.forEach((p, i) => {
+    p.start = i * intervalWidth;
+    p.end = (i + 1) * intervalWidth;
+    p.sec = yToSecValue(p.y);
+  });
+}
+
+/**
+ * キャンバス座標 → 画像座標
+ */
+function canvasToImageCoords(canvas, clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return {
+    x: (clientX - rect.left) * scaleX,
+    y: (clientY - rect.top) * scaleY,
+  };
+}
+
+/**
+ * 指定座標に最も近い点のインデックスを返す (許容範囲内なら)
+ */
+function findHitPoint(x, y) {
+  const hitRadius = editState.radius * 1.5;  // タップしやすいよう少し広めに
+  let bestIdx = -1;
+  let bestDist = hitRadius;
+  for (let i = 0; i < state.results.length; i++) {
+    const p = state.results[i];
+    const d = Math.hypot(p.x - x, p.y - y);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  }
+  return bestIdx;
+}
+
+function setupEditHandlers(canvas) {
+  // 共通: イベントから座標を取得
+  function getEventCoords(e) {
+    const touch = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]);
+    const cx = touch ? touch.clientX : e.clientX;
+    const cy = touch ? touch.clientY : e.clientY;
+    return canvasToImageCoords(canvas, cx, cy);
+  }
+
+  // ダウン: 既存の点をヒットしたか確認
+  function onDown(e) {
+    e.preventDefault();
+    const pt = getEventCoords(e);
+    editState.pointerDownPt = pt;
+    editState.pointerDownIdx = findHitPoint(pt.x, pt.y);
+    editState.moved = false;
+    editState.dragIdx = -1;
+  }
+
+  // ムーブ: 既存の点をドラッグしている場合は位置更新
+  function onMove(e) {
+    if (editState.pointerDownPt === null) return;
+    e.preventDefault();
+    const pt = getEventCoords(e);
+    const dx = pt.x - editState.pointerDownPt.x;
+    const dy = pt.y - editState.pointerDownPt.y;
+    const moveDist = Math.hypot(dx, dy);
+    // 5px以上動いたらドラッグ判定
+    if (moveDist > 5 || editState.moved) {
+      editState.moved = true;
+      if (editState.pointerDownIdx >= 0) {
+        // 既存の点をドラッグ
+        editState.dragIdx = editState.pointerDownIdx;
+        const p = state.results[editState.pointerDownIdx];
+        p.x = pt.x;
+        p.y = pt.y;
+        // 秒数を再計算 (X順序は壊さない、ドラッグ中は)
+        p.sec = yToSecValue(p.y);
+        redrawResult();
+      }
+    }
+  }
+
+  // アップ: ドラッグ確定 or タップ判定
+  function onUp(e) {
+    if (editState.pointerDownPt === null) return;
+    e.preventDefault();
+    const pt = getEventCoords(e);
+
+    if (!editState.moved) {
+      // タップ: 点をヒットしたら削除、空白なら追加
+      if (editState.pointerDownIdx >= 0) {
+        // 既存の点を削除
+        state.results.splice(editState.pointerDownIdx, 1);
+      } else {
+        // 新規追加
+        state.results.push({
+          x: pt.x,
+          y: pt.y,
+          start: 0,
+          end: 0,
+          sec: yToSecValue(pt.y),
+        });
+      }
+      recomputeResults();
+    } else {
+      // ドラッグ後: X順序に従って再ソート + start/end/sec を再計算
+      recomputeResults();
+    }
+
+    editState.pointerDownPt = null;
+    editState.pointerDownIdx = -1;
+    editState.dragIdx = -1;
+    editState.moved = false;
+    redrawResult();
+  }
+
+  // タッチイベント (スマホ)
+  canvas.addEventListener('touchstart', onDown, { passive: false });
+  canvas.addEventListener('touchmove', onMove, { passive: false });
+  canvas.addEventListener('touchend', onUp, { passive: false });
+  canvas.addEventListener('touchcancel', onUp, { passive: false });
+
+  // マウスイベント (PC)
+  canvas.addEventListener('mousedown', onDown);
+  canvas.addEventListener('mousemove', onMove);
+  canvas.addEventListener('mouseup', onUp);
+  canvas.addEventListener('mouseleave', (e) => {
+    if (editState.pointerDownPt !== null) onUp(e);
+  });
 }
 
 // =========== コピーボタン ===========
