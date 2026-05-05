@@ -79,10 +79,13 @@ function detectGrid() {
   const px = ctx.getImageData(0, 0, W, H).data;
 
   // 灰色のグリッド線 (R≈G≈B かつ 200-245)
-  const threshold = W * 0.5;  // 幅の半分以上が灰色なら水平線
+  const threshold = W * 0.4;  // 幅の40%以上が灰色なら水平線
   const candidateRows = [];
+  // 各候補行のグリッド線のX座標範囲も記録
+  const rowXRange = {};  // y -> [xMin, xMax]
   for (let y = 0; y < H; y++) {
     let count = 0;
+    let xMin = W, xMax = 0;
     const off = y * W * 4;
     for (let x = 0; x < W; x++) {
       const i = off + x * 4;
@@ -90,9 +93,14 @@ function detectGrid() {
       if (r >= 200 && r <= 245 &&
           Math.abs(r - g) < 10 && Math.abs(g - b) < 10) {
         count++;
+        if (x < xMin) xMin = x;
+        if (x > xMax) xMax = x;
       }
     }
-    if (count > threshold) candidateRows.push(y);
+    if (count > threshold) {
+      candidateRows.push(y);
+      rowXRange[y] = [xMin, xMax];
+    }
   }
 
   // 連続行のグループ化
@@ -110,6 +118,25 @@ function detectGrid() {
     groups.push(Math.round(cur.reduce((a,b)=>a+b) / cur.length));
   }
 
+  // グリッド線のX座標範囲 (主要グリッド線の最小/最大)
+  if (candidateRows.length > 0) {
+    let xMins = [], xMaxs = [];
+    for (const y of candidateRows) {
+      if (rowXRange[y]) {
+        xMins.push(rowXRange[y][0]);
+        xMaxs.push(rowXRange[y][1]);
+      }
+    }
+    // 中央値を使う
+    xMins.sort((a, b) => a - b);
+    xMaxs.sort((a, b) => a - b);
+    state.detected.gridXLeft = xMins[Math.floor(xMins.length / 2)];
+    state.detected.gridXRight = xMaxs[Math.floor(xMaxs.length / 2)];
+  } else {
+    state.detected.gridXLeft = 0;
+    state.detected.gridXRight = W;
+  }
+
   if (groups.length >= 2) {
     state.detected.gridYTop = groups[0];
     state.detected.gridYBottom = groups[groups.length - 1];
@@ -120,6 +147,7 @@ function detectGrid() {
     state.detected.gridYBottom = Math.round(H * 0.85);
     state.detected.gridYAll = [];
   }
+  console.log('Grid detected:', state.detected);
 }
 
 // =========== STEP 2: 抽出ボタン ===========
@@ -171,10 +199,19 @@ function extractPoints(topValue, bottomValue, pointCount, intervalWidth) {
   const targetColor = detectGraphColor(px, W, H);
   console.log('Detected graph color:', targetColor);
 
-  // 2. 色マスク作成
+  // === グラフ領域 (グリッド線で囲まれた範囲) ===
+  // Y範囲: 一番上のグリッド線から一番下のグリッド線まで (少しマージン)
+  // X範囲: グリッド線のX座標範囲 (Y軸ラベルやX軸ラベルを除外)
+  const yMin = Math.max(0, (state.detected.gridYTop || 0) - 5);
+  const yMax = Math.min(H, (state.detected.gridYBottom || H) + 5);
+  const xMin = state.detected.gridXLeft || 0;
+  const xMax = state.detected.gridXRight || W;
+  console.log('Graph area: X=', xMin, '-', xMax, 'Y=', yMin, '-', yMax);
+
+  // 2. 色マスク作成 (グラフ領域内のみ)
   const mask = new Uint8Array(W * H);
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
+  for (let y = yMin; y < yMax; y++) {
+    for (let x = xMin; x < xMax; x++) {
       const i = (y * W + x) * 4;
       const r = px[i], g = px[i + 1], b = px[i + 2];
       if (isColorSimilar(r, g, b, targetColor)) {
@@ -185,45 +222,48 @@ function extractPoints(topValue, bottomValue, pointCount, intervalWidth) {
 
   // === 3. erosion を増やしながら、最も多くの「揃った正方形成分」が取れるサイズを探す ===
   let bestEr = 0;
-  let bestPoints = [];
+  let bestEroded = mask;
+  let bestN = 0;
   for (let er = 0; er <= 10; er++) {
     const eroded = (er === 0) ? mask : erode(mask, W, H, er);
     if (sumMask(eroded) === 0) break;
 
-    const comps = getSquareComponents(eroded, W, H, 10);
-    const dominantCount = countDominantSizeGroup(comps);
-    if (dominantCount > bestPoints.length && dominantCount >= 3) {
+    const comps = getSquareComponents(eroded, W, H, 5);
+    const cluster = getDominantCluster(comps, 0.3);
+    if (cluster.length > bestN && cluster.length >= 3) {
+      bestN = cluster.length;
       bestEr = er;
-      bestPoints = comps;
+      bestEroded = eroded;
     }
   }
-  console.log('Best erosion:', bestEr, 'Components:', bestPoints.length);
+  console.log('Best erosion:', bestEr, 'Cluster size:', bestN);
 
-  if (bestPoints.length < 2) {
-    throw new Error('点が見つかりませんでした (検出数: ' + bestPoints.length + ')。画像のトリミングを確認してください');
+  if (bestN < 2) {
+    throw new Error('点が見つかりませんでした (検出数: ' + bestN + ')。画像のトリミングを確認してください');
   }
 
-  // === 4. erosion+dilation で点を元のサイズに戻して再抽出 ===
-  let finalMask;
-  if (bestEr === 0) {
-    finalMask = mask;
-  } else {
-    const eroded = erode(mask, W, H, bestEr);
-    finalMask = dilate(eroded, W, H, bestEr);
+  // === 4. erosion 後の連結成分の中心を「点」として使う ===
+  // 端の点は erosion で消えていることがあるので、元マスクの連結成分で復元する
+  const erodedComps = getSquareComponents(bestEroded, W, H, 5);
+  // 元マスクのラベル
+  const origLabels = labelComponents(mask, W, H);
+  const seenOrig = new Set();
+  const points = [];
+  for (const ec of erodedComps) {
+    const cx = Math.round(ec.cx);
+    const cy = Math.round(ec.cy);
+    const origLabel = origLabels[cy * W + cx];
+    if (origLabel === 0 || !seenOrig.has(origLabel)) {
+      seenOrig.add(origLabel);
+      points.push({ x: ec.cx, y: ec.cy });
+    } else {
+      // 元マスクの同じ成分内に複数のerosion成分がある場合 (点が線でつながっている場合)
+      // → erosion後の中心位置をそのまま採用
+      points.push({ x: ec.cx, y: ec.cy });
+    }
   }
-  const components = getSquareComponents(finalMask, W, H, 10);
 
-  // === 5. サイズが揃っているもの (中央値の ±50%) を選択 ===
-  if (components.length === 0) {
-    throw new Error('点が見つかりませんでした');
-  }
-  const sortedCounts = components.map(c => c.count).sort((a, b) => a - b);
-  const medianCount = sortedCounts[Math.floor(sortedCounts.length / 2)];
-  const points = components
-    .filter(c => c.count >= medianCount * 0.5 && c.count <= medianCount * 2.0)
-    .map(c => ({ x: c.cx, y: c.cy }));
-
-  console.log('Final points:', points.length, '(from', components.length, 'components)');
+  console.log('Final points:', points.length);
 
   if (points.length < 2) {
     throw new Error('点が見つかりませんでした (検出数: ' + points.length + ')');
@@ -402,6 +442,57 @@ function countDominantSizeGroup(comps) {
     if (n > best) best = n;
   }
   return best;
+}
+
+/**
+ * 成分から「最頻サイズクラスタ」(中心サイズ ±ratio) を抽出
+ */
+function getDominantCluster(comps, ratio) {
+  if (!comps.length) return [];
+  let bestCenter = comps[0].count;
+  let bestN = 0;
+  for (const c of comps) {
+    const lo = c.count * (1 - ratio);
+    const hi = c.count * (1 + ratio);
+    let n = 0;
+    for (const c2 of comps) {
+      if (c2.count >= lo && c2.count <= hi) n++;
+    }
+    if (n > bestN) { bestN = n; bestCenter = c.count; }
+  }
+  const lo = bestCenter * (1 - ratio);
+  const hi = bestCenter * (1 + ratio);
+  return comps.filter(c => c.count >= lo && c.count <= hi);
+}
+
+/**
+ * mask の各画素にラベル番号を割り当て、ラベル配列を返す (BFS)
+ * 0 = mask が 0 の画素
+ */
+function labelComponents(mask, W, H) {
+  const labels = new Int32Array(W * H);
+  const queue = new Int32Array(W * H);
+  let nextLabel = 1;
+  for (let sy = 0; sy < H; sy++) {
+    for (let sx = 0; sx < W; sx++) {
+      const sIdx = sy * W + sx;
+      if (!mask[sIdx] || labels[sIdx]) continue;
+      let head = 0, tail = 0;
+      queue[tail++] = sIdx;
+      labels[sIdx] = nextLabel;
+      while (head < tail) {
+        const idx = queue[head++];
+        const x = idx % W;
+        const y = (idx - x) / W;
+        if (x > 0 && mask[idx-1] && !labels[idx-1]) { labels[idx-1] = nextLabel; queue[tail++] = idx-1; }
+        if (x < W-1 && mask[idx+1] && !labels[idx+1]) { labels[idx+1] = nextLabel; queue[tail++] = idx+1; }
+        if (y > 0 && mask[idx-W] && !labels[idx-W]) { labels[idx-W] = nextLabel; queue[tail++] = idx-W; }
+        if (y < H-1 && mask[idx+W] && !labels[idx+W]) { labels[idx+W] = nextLabel; queue[tail++] = idx+W; }
+      }
+      nextLabel++;
+    }
+  }
+  return labels;
 }
 
 // =========== 結果描画 ===========
