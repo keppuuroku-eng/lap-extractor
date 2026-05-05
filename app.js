@@ -51,6 +51,7 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
 
     // Y軸グリッド線を自動検出して値の初期推定
     detectGrid();
+    buildGridValueInputs();
 
     // ② のセクションを表示
     document.getElementById('paramSection').classList.remove('hidden');
@@ -151,6 +152,96 @@ function detectGrid() {
   console.log('Grid detected:', state.detected);
 }
 
+// =========== グリッド線の値入力欄を動的生成 ===========
+function buildGridValueInputs() {
+  const container = document.getElementById('gridValuesContainer');
+  container.innerHTML = '';
+
+  const gridYAll = state.detected.gridYAll || [];
+
+  // フォールバック: グリッド線が検出されなければ 2 本の入力欄
+  let lines;
+  if (gridYAll.length >= 2) {
+    lines = gridYAll;
+  } else {
+    lines = [state.detected.gridYTop, state.detected.gridYBottom];
+  }
+
+  // 競馬ラップグラフでよくある 10〜14秒、1秒刻みを初期値として推定
+  // 線の本数に応じてデフォルト値を算出 (上から 10, 11, 12, ...)
+  const defaultStart = 10;
+  const defaultStep = 1;
+
+  lines.forEach((y, i) => {
+    const row = document.createElement('div');
+    row.className = 'gridline-row';
+
+    const idx = document.createElement('div');
+    idx.className = 'index';
+    idx.textContent = (i + 1) + '本目';
+
+    const desc = document.createElement('div');
+    desc.className = 'desc';
+    if (i === 0) desc.textContent = '一番上の線';
+    else if (i === lines.length - 1) desc.textContent = '一番下の線';
+    else desc.textContent = '';
+
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.step = '0.1';
+    input.inputMode = 'decimal';
+    input.value = defaultStart + i * defaultStep;
+    input.dataset.gridY = y;
+    input.dataset.gridIdx = i;
+
+    const unit = document.createElement('span');
+    unit.className = 'unit';
+    unit.textContent = '秒';
+
+    row.appendChild(idx);
+    row.appendChild(desc);
+    row.appendChild(input);
+    row.appendChild(unit);
+    container.appendChild(row);
+  });
+
+  console.log('Built', lines.length, 'gridline inputs');
+}
+
+// =========== グリッド線の値からY軸キャリブレーションを取得 ===========
+function getCalibrationFromInputs() {
+  const inputs = document.querySelectorAll('#gridValuesContainer input');
+  const points = [];
+  inputs.forEach(inp => {
+    const y = parseFloat(inp.dataset.gridY);
+    const v = parseFloat(inp.value);
+    if (isFinite(y) && isFinite(v)) {
+      points.push({ y, v });
+    }
+  });
+  return points;  // [{y: 21, v: 10}, {y: 269, v: 11}, ...]
+}
+
+// =========== Y座標から秒数を計算 (補間) ===========
+function yToSecondsFromCalibration(y, calibPoints) {
+  if (calibPoints.length < 2) return NaN;
+  // y は通常、calibPoints の y_min 〜 y_max 内
+  // 最も近い 2 点で線形補間
+  let p1 = calibPoints[0], p2 = calibPoints[calibPoints.length - 1];
+  for (let i = 0; i < calibPoints.length - 1; i++) {
+    if (calibPoints[i].y <= y && y <= calibPoints[i+1].y) {
+      p1 = calibPoints[i]; p2 = calibPoints[i+1];
+      break;
+    }
+  }
+  // 範囲外 (上端より上、下端より下) は両端の2点で外挿
+  if (y < calibPoints[0].y) { p1 = calibPoints[0]; p2 = calibPoints[1]; }
+  else if (y > calibPoints[calibPoints.length-1].y) {
+    p1 = calibPoints[calibPoints.length-2]; p2 = calibPoints[calibPoints.length-1];
+  }
+  return p1.v + (y - p1.y) / (p2.y - p1.y) * (p2.v - p1.v);
+}
+
 // =========== STEP 2: 抽出ボタン ===========
 document.getElementById('btnExtract').addEventListener('click', () => {
   if (!state.imgEl) {
@@ -158,15 +249,16 @@ document.getElementById('btnExtract').addEventListener('click', () => {
     return;
   }
 
-  const topValue = parseFloat(document.getElementById('topValue').value);
-  const bottomValue = parseFloat(document.getElementById('bottomValue').value);
+  const calibPoints = getCalibrationFromInputs();
   const pointCount = parseInt(document.getElementById('pointCount').value, 10);
   const intervalWidth = parseInt(document.getElementById('intervalWidth').value, 10);
 
-  if (!isFinite(topValue) || !isFinite(bottomValue) || topValue >= bottomValue) {
-    setStatus('Y軸の値が正しくありません', 'error');
+  if (calibPoints.length < 2) {
+    setStatus('Y軸の値が2つ以上必要です', 'error');
     return;
   }
+  // ソート (Y座標順)
+  calibPoints.sort((a, b) => a.y - b.y);
   if (pointCount < 2 || pointCount > 50) {
     setStatus('点の数を確認してください', 'error');
     return;
@@ -174,8 +266,8 @@ document.getElementById('btnExtract').addEventListener('click', () => {
 
   try {
     // 編集機能用に値を保存
-    state.calibration = { topValue, bottomValue, pointCount, intervalWidth };
-    extractPoints(topValue, bottomValue, pointCount, intervalWidth);
+    state.calibration = { calibPoints, pointCount, intervalWidth };
+    extractPoints(calibPoints, pointCount, intervalWidth);
     renderResult();
     document.getElementById('resultSection').classList.remove('hidden');
     document.getElementById('resultSection').scrollIntoView({ behavior: 'smooth' });
@@ -187,7 +279,7 @@ document.getElementById('btnExtract').addEventListener('click', () => {
 });
 
 // =========== 点抽出ロジック ===========
-function extractPoints(topValue, bottomValue, pointCount, intervalWidth) {
+function extractPoints(calibPoints, pointCount, intervalWidth) {
   const img = state.imgEl;
   const W = img.naturalWidth;
   const H = img.naturalHeight;
@@ -294,17 +386,13 @@ function extractPoints(topValue, bottomValue, pointCount, intervalWidth) {
     selected.sort((a, b) => a.x - b.x);
   }
 
-  // 7. Y → 値の変換
-  const yTop = state.detected.gridYTop;
-  const yBot = state.detected.gridYBottom;
-  const yToValue = (y) => topValue + (y - yTop) / (yBot - yTop) * (bottomValue - topValue);
-
+  // 7. Y → 値の変換 (キャリブレーション点を使った補間)
   state.results = selected.map((p, i) => ({
     x: p.x,
     y: p.y,
     start: i * intervalWidth,
     end: (i + 1) * intervalWidth,
-    sec: yToValue(p.y),
+    sec: yToSecondsFromCalibration(p.y, calibPoints),
   }));
 }
 
@@ -576,11 +664,7 @@ function redrawResult() {
  * Y座標を秒数に変換 (再計算用)
  */
 function yToSecValue(y) {
-  const yTop = state.detected.gridYTop;
-  const yBot = state.detected.gridYBottom;
-  const vTop = state.calibration.topValue;
-  const vBot = state.calibration.bottomValue;
-  return vTop + (y - yTop) / (yBot - yTop) * (vBot - vTop);
+  return yToSecondsFromCalibration(y, state.calibration.calibPoints || []);
 }
 
 /**
@@ -613,7 +697,8 @@ function canvasToImageCoords(canvas, clientX, clientY) {
  * 指定座標に最も近い点のインデックスを返す (許容範囲内なら)
  */
 function findHitPoint(x, y) {
-  const hitRadius = editState.radius * 1.5;  // タップしやすいよう少し広めに
+  // タップしやすいよう、点の半径の 2.5倍まで広めに判定
+  const hitRadius = editState.radius * 2.5;
   let bestIdx = -1;
   let bestDist = hitRadius;
   for (let i = 0; i < state.results.length; i++) {
@@ -633,6 +718,10 @@ function setupEditHandlers(canvas) {
     return canvasToImageCoords(canvas, cx, cy);
   }
 
+  // 最後にタップが終了した時刻と位置 (ダブルタップ判定用)
+  let lastTapTime = 0;
+  let lastTapPt = null;
+
   // ダウン: 既存の点をヒットしたか確認
   function onDown(e) {
     e.preventDefault();
@@ -641,6 +730,11 @@ function setupEditHandlers(canvas) {
     editState.pointerDownIdx = findHitPoint(pt.x, pt.y);
     editState.moved = false;
     editState.dragIdx = -1;
+    // 点をヒットした場合は、ダウン時点で「ドラッグ候補」として表示しておく
+    if (editState.pointerDownIdx >= 0) {
+      editState.dragIdx = editState.pointerDownIdx;
+      redrawResult();
+    }
   }
 
   // ムーブ: 既存の点をドラッグしている場合は位置更新
@@ -651,47 +745,75 @@ function setupEditHandlers(canvas) {
     const dx = pt.x - editState.pointerDownPt.x;
     const dy = pt.y - editState.pointerDownPt.y;
     const moveDist = Math.hypot(dx, dy);
-    // 5px以上動いたらドラッグ判定
-    if (moveDist > 5 || editState.moved) {
+    // 動いた閾値 (画像座標で 8px 以上)
+    const moveThresh = 8 * editState.scale;
+    if (moveDist > moveThresh || editState.moved) {
       editState.moved = true;
       if (editState.pointerDownIdx >= 0) {
         // 既存の点をドラッグ
-        editState.dragIdx = editState.pointerDownIdx;
         const p = state.results[editState.pointerDownIdx];
         p.x = pt.x;
         p.y = pt.y;
-        // 秒数を再計算 (X順序は壊さない、ドラッグ中は)
         p.sec = yToSecValue(p.y);
         redrawResult();
       }
     }
   }
 
-  // アップ: ドラッグ確定 or タップ判定
+  // アップ: ドラッグ確定 or タップ判定 (ダブルタップ追加 / シングルタップ削除)
   function onUp(e) {
     if (editState.pointerDownPt === null) return;
     e.preventDefault();
     const pt = getEventCoords(e);
+    const now = Date.now();
 
-    if (!editState.moved) {
-      // タップ: 点をヒットしたら削除、空白なら追加
-      if (editState.pointerDownIdx >= 0) {
-        // 既存の点を削除
-        state.results.splice(editState.pointerDownIdx, 1);
-      } else {
-        // 新規追加
-        state.results.push({
-          x: pt.x,
-          y: pt.y,
-          start: 0,
-          end: 0,
-          sec: yToSecValue(pt.y),
-        });
-      }
-      recomputeResults();
-    } else {
+    if (editState.moved) {
       // ドラッグ後: X順序に従って再ソート + start/end/sec を再計算
       recomputeResults();
+      // タップ履歴をリセット (ドラッグ後はダブルタップ扱いしない)
+      lastTapTime = 0;
+      lastTapPt = null;
+    } else {
+      // 移動なし = タップ
+      // ダブルタップ判定: 直前のタップから 350ms 以内 + 同じ位置付近
+      const isDoubleTap = lastTapTime > 0
+        && (now - lastTapTime) < 350
+        && lastTapPt
+        && Math.hypot(pt.x - lastTapPt.x, pt.y - lastTapPt.y) < 30 * editState.scale;
+
+      if (isDoubleTap) {
+        // ダブルタップ → 点を追加
+        // ただし、既存の点の上でダブルタップした場合は削除
+        if (editState.pointerDownIdx >= 0) {
+          state.results.splice(editState.pointerDownIdx, 1);
+        } else {
+          state.results.push({
+            x: pt.x,
+            y: pt.y,
+            start: 0,
+            end: 0,
+            sec: yToSecValue(pt.y),
+          });
+        }
+        recomputeResults();
+        // ダブルタップ後はリセット
+        lastTapTime = 0;
+        lastTapPt = null;
+      } else {
+        // シングルタップ → 既存点があれば削除
+        if (editState.pointerDownIdx >= 0) {
+          state.results.splice(editState.pointerDownIdx, 1);
+          recomputeResults();
+          // シングルタップ後はリセット (連続でダブルタップ判定にならないように)
+          lastTapTime = 0;
+          lastTapPt = null;
+        } else {
+          // 空白部分のシングルタップ → 何もしない (誤動作防止)
+          // ダブルタップ判定のため、タップ履歴を記録
+          lastTapTime = now;
+          lastTapPt = pt;
+        }
+      }
     }
 
     editState.pointerDownPt = null;
@@ -702,18 +824,17 @@ function setupEditHandlers(canvas) {
   }
 
   // タッチイベント (スマホ)
+  // タッチダウンは canvas のみ、ムーブ・アップは document に登録して
+  // 指がキャンバスからはみ出してもドラッグ継続できるようにする
   canvas.addEventListener('touchstart', onDown, { passive: false });
-  canvas.addEventListener('touchmove', onMove, { passive: false });
-  canvas.addEventListener('touchend', onUp, { passive: false });
-  canvas.addEventListener('touchcancel', onUp, { passive: false });
+  document.addEventListener('touchmove', onMove, { passive: false });
+  document.addEventListener('touchend', onUp, { passive: false });
+  document.addEventListener('touchcancel', onUp, { passive: false });
 
   // マウスイベント (PC)
   canvas.addEventListener('mousedown', onDown);
-  canvas.addEventListener('mousemove', onMove);
-  canvas.addEventListener('mouseup', onUp);
-  canvas.addEventListener('mouseleave', (e) => {
-    if (editState.pointerDownPt !== null) onUp(e);
-  });
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
 }
 
 // =========== コピーボタン ===========
