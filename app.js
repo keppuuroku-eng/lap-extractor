@@ -315,49 +315,35 @@ function extractPoints(calibPoints, pointCount, intervalWidth) {
     }
   }
 
-  // === 3. erosion を増やしながら、最も多くの「揃った正方形成分」が取れるサイズを探す ===
+  // === 3. erosion を増やしながら、X軸方向に等間隔に並んだ正方形成分が取れるサイズを探す ===
+  // スコアリング:
+  //  - サイズが揃っている (中央値±50%)
+  //  - X軸方向の間隔が均等 (CV が小さい)
+  //  - 期待される点数 (pointCount) に近い
   let bestEr = 0;
-  let bestEroded = mask;
-  let bestN = 0;
-  for (let er = 0; er <= 10; er++) {
+  let bestScore = -1;
+  let bestPoints = [];
+  for (let er = 0; er <= 8; er++) {
     const eroded = (er === 0) ? mask : erode(mask, W, H, er);
     if (sumMask(eroded) === 0) break;
 
-    const comps = getSquareComponents(eroded, W, H, 5);
-    const cluster = getDominantCluster(comps, 0.3);
-    if (cluster.length > bestN && cluster.length >= 3) {
-      bestN = cluster.length;
+    // erosion 後は最低 15 px のみを点候補とする (文字断片を除去)
+    const comps = getSquareComponents(eroded, W, H, 15);
+    const evalResult = evaluateAsDots(comps, pointCount);
+    if (evalResult.score > bestScore) {
       bestEr = er;
-      bestEroded = eroded;
+      bestScore = evalResult.score;
+      bestPoints = evalResult.points;
     }
   }
-  console.log('Best erosion:', bestEr, 'Cluster size:', bestN);
+  console.log('Best erosion:', bestEr, 'Score:', bestScore.toFixed(2), 'Points:', bestPoints.length);
 
-  if (bestN < 2) {
-    throw new Error('点が見つかりませんでした (検出数: ' + bestN + ')。画像のトリミングを確認してください');
+  if (bestPoints.length < 2) {
+    throw new Error('点が見つかりませんでした (検出数: ' + bestPoints.length + ')。画像のトリミングを確認してください');
   }
 
-  // === 4. erosion + 少し小さい dilation で点を再構築 ===
-  // dilation サイズを erosion より 1 小さくすることで、線が完全に復活せず、
-  // 端の点も含めて適切に再現できる
-  let finalMask;
-  if (bestEr === 0) {
-    finalMask = mask;
-  } else {
-    const eroded = erode(mask, W, H, bestEr);
-    const dilateR = Math.max(1, bestEr - 1);
-    finalMask = dilate(eroded, W, H, dilateR);
-  }
-
-  const finalComps = getSquareComponents(finalMask, W, H, 10);
-  if (finalComps.length === 0) {
-    throw new Error('点が見つかりませんでした');
-  }
-  // クラスタフィルタ (中央値 ±50%)
-  const points = getDominantCluster(finalComps, 0.5)
-    .map(c => ({ x: c.cx, y: c.cy }));
-
-  console.log('Final points:', points.length);
+  // 検出された点を直接使う (erosion 後の中心位置でOK)
+  const points = bestPoints.map(c => ({ x: c.cx, y: c.cy }));
 
   if (points.length < 2) {
     throw new Error('点が見つかりませんでした (検出数: ' + points.length + ')');
@@ -508,7 +494,7 @@ function getSquareComponents(mask, W, H, minSize) {
       const w = maxX - minX + 1;
       const h = maxY - minY + 1;
       const aspect = w / Math.max(h, 1);
-      if (aspect < 0.5 || aspect > 2.0) continue;
+      if (aspect < 0.4 || aspect > 2.5) continue;
       comps.push({ cx: sumX / count, cy: sumY / count, w, h, count });
     }
   }
@@ -553,6 +539,49 @@ function getDominantCluster(comps, ratio) {
   const lo = bestCenter * (1 - ratio);
   const hi = bestCenter * (1 + ratio);
   return comps.filter(c => c.count >= lo && c.count <= hi);
+}
+
+/**
+ * 成分の集合を「等間隔に並んだ点群」として評価する
+ * - サイズが揃っている (中央値±50%) ものを候補にする
+ * - X軸方向の間隔が均等であるほど高得点
+ * - 期待される点数 (expectedN) に近いほど高得点
+ *
+ * 戻り値: { score: 数値, points: 候補となる成分の配列 }
+ */
+function evaluateAsDots(comps, expectedN) {
+  if (comps.length < 3) return { score: 0, points: [] };
+  // サイズの中央値
+  const counts = comps.map(c => c.count).sort((a, b) => a - b);
+  const median = counts[Math.floor(counts.length / 2)];
+  // 中央値 ±50% に収まる成分のみ (文字断片や巨大成分を除外)
+  const candidates = comps.filter(c => c.count >= median * 0.5 && c.count <= median * 1.5);
+  if (candidates.length < 3) return { score: 0, points: [] };
+
+  // X座標でソート
+  candidates.sort((a, b) => a.cx - b.cx);
+
+  // X軸の間隔の均等性
+  const xs = candidates.map(c => c.cx);
+  const diffs = [];
+  for (let i = 1; i < xs.length; i++) diffs.push(xs[i] - xs[i-1]);
+  if (!diffs.length) return { score: 0, points: candidates };
+  const meanDiff = diffs.reduce((a, b) => a + b) / diffs.length;
+  let varDiff = 0;
+  diffs.forEach(d => { varDiff += (d - meanDiff) ** 2; });
+  varDiff /= diffs.length;
+  const stdDiff = Math.sqrt(varDiff);
+  const cv = meanDiff > 0 ? stdDiff / meanDiff : 1.0;  // 変動係数
+
+  // 期待数との近さ
+  const nScore = 1.0 - Math.abs(candidates.length - expectedN) / Math.max(expectedN, candidates.length);
+
+  // 等間隔スコア (CVが小さいほど良い)
+  const evenScore = Math.max(0, 1.0 - cv * 2);
+
+  // 総合スコア
+  const score = candidates.length * 0.5 + nScore * 5 + evenScore * 5;
+  return { score, points: candidates };
 }
 
 /**
@@ -745,8 +774,10 @@ function setupEditHandlers(canvas) {
     const dx = pt.x - editState.pointerDownPt.x;
     const dy = pt.y - editState.pointerDownPt.y;
     const moveDist = Math.hypot(dx, dy);
-    // 動いた閾値 (画像座標で 8px 以上)
-    const moveThresh = 8 * editState.scale;
+    // 動いた閾値 (画像座標で):
+    //  - 点をヒット中: 3px (すぐ動かしたいので小さめ)
+    //  - 空白部分: 12px (ジッターと区別)
+    const moveThresh = (editState.pointerDownIdx >= 0 ? 3 : 12) * editState.scale;
     if (moveDist > moveThresh || editState.moved) {
       editState.moved = true;
       if (editState.pointerDownIdx >= 0) {
