@@ -159,6 +159,43 @@ textarea {
 }
 .error { color: #EF4444; }
 .success { color: #10B981; }
+
+/* グリッド線の値入力 */
+.gridline-row {
+  display: grid;
+  grid-template-columns: 30px 1fr 80px auto;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.gridline-row .index {
+  font-weight: 600;
+  color: #5BA3D9;
+  text-align: center;
+  font-size: 13px;
+}
+.gridline-row .desc {
+  font-size: 12px;
+  color: #6B7280;
+}
+.gridline-row input {
+  font-size: 16px;
+  padding: 8px 10px;
+  border: 1px solid #E1E8ED;
+  border-radius: 6px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  width: 100%;
+}
+.gridline-row input:focus {
+  outline: none;
+  border-color: #5BA3D9;
+  box-shadow: 0 0 0 3px rgba(91,163,217,0.15);
+}
+.gridline-row .unit {
+  font-size: 13px;
+  color: #6B7280;
+}
 </style>
 </head>
 <body>
@@ -188,17 +225,11 @@ textarea {
   <!-- 2. パラメータ設定 -->
   <section id="paramSection" class="hidden">
     <h2>② 値を設定</h2>
-    <p class="hint">グラフのY軸の値を入力してください</p>
-    <div class="form-row">
-      <label>Y軸 一番上の値</label>
-      <input type="number" id="topValue" step="0.1" value="10" inputmode="decimal">
-      <span class="unit">秒</span>
+    <p class="hint" id="gridLineHint">画像から検出されたグリッド線（横線）に値を入力してください。<br>上から順に「10、11、12、13、14」のように入力してください。</p>
+    <div id="gridValuesContainer">
+      <!-- 動的にグリッド線の入力欄を挿入 -->
     </div>
-    <div class="form-row">
-      <label>Y軸 一番下の値</label>
-      <input type="number" id="bottomValue" step="0.1" value="14" inputmode="decimal">
-      <span class="unit">秒</span>
-    </div>
+    <hr style="border: none; border-top: 1px solid #E1E8ED; margin: 16px 0;">
     <div class="form-row">
       <label>X軸の点の数</label>
       <input type="number" id="pointCount" step="1" min="2" max="50" value="16" inputmode="numeric">
@@ -217,9 +248,9 @@ textarea {
     <h2>③ 抽出結果</h2>
     <p class="hint" id="editHint">
       💡 検出が間違っていたら修正できます<br>
-      ・空白部分をタップ → 点を追加<br>
-      ・赤い丸をタップ → 削除<br>
-      ・赤い丸をドラッグ → 位置を移動
+      ・空白部分を<strong>ダブルタップ</strong> → 点を追加<br>
+      ・赤い丸を<strong>シングルタップ</strong> → 削除<br>
+      ・赤い丸を<strong>ドラッグ</strong> → 位置を移動
     </p>
     <div class="preview" style="position: relative;">
       <canvas id="resultCanvas" style="touch-action: none;"></canvas>
