@@ -215,8 +215,14 @@ textarea {
   <!-- 3. 結果 -->
   <section id="resultSection" class="hidden">
     <h2>③ 抽出結果</h2>
-    <div class="preview">
-      <canvas id="resultCanvas"></canvas>
+    <p class="hint" id="editHint">
+      💡 検出が間違っていたら修正できます<br>
+      ・空白部分をタップ → 点を追加<br>
+      ・赤い丸をタップ → 削除<br>
+      ・赤い丸をドラッグ → 位置を移動
+    </p>
+    <div class="preview" style="position: relative;">
+      <canvas id="resultCanvas" style="touch-action: none;"></canvas>
     </div>
     <div class="result-output" style="margin-top: 12px;">
       <textarea id="resultText" readonly></textarea>
