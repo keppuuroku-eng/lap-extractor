@@ -167,13 +167,11 @@ function extractPoints(topValue, bottomValue, pointCount, intervalWidth) {
   c.getContext('2d').drawImage(img, 0, 0);
   const px = c.getContext('2d').getImageData(0, 0, W, H).data;
 
-  // === 1. 画像内の支配色を自動検出 ===
-  // 「白でもグレーでもない、最も多く出現する色」をグラフの色とする
-  // HSV的に: 彩度が高い、または黒っぽい (R+G+B が低い) 画素が候補
+  // === 1. グラフ色を自動検出 ===
   const targetColor = detectGraphColor(px, W, H);
   console.log('Detected graph color:', targetColor);
 
-  // 2. 検出した色のマスクを作成
+  // 2. 色マスク作成
   const mask = new Uint8Array(W * H);
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
@@ -185,120 +183,50 @@ function extractPoints(topValue, bottomValue, pointCount, intervalWidth) {
     }
   }
 
-  // === 3. 線除去のしきい値を自動決定 ===
-  // 縦方向のラン長ヒストグラムを作り、「線」と「点」の間の谷を検出
-  const runHist = new Int32Array(50);
-  for (let x = 0; x < W; x++) {
-    let y = 0;
-    while (y < H) {
-      if (mask[y * W + x]) {
-        const start = y;
-        while (y < H && mask[y * W + x]) y++;
-        const len = y - start;
-        if (len < 50) runHist[len]++;
-      } else y++;
+  // === 3. erosion を増やしながら、最も多くの「揃った正方形成分」が取れるサイズを探す ===
+  let bestEr = 0;
+  let bestPoints = [];
+  for (let er = 0; er <= 10; er++) {
+    const eroded = (er === 0) ? mask : erode(mask, W, H, er);
+    if (sumMask(eroded) === 0) break;
+
+    const comps = getSquareComponents(eroded, W, H, 10);
+    const dominantCount = countDominantSizeGroup(comps);
+    if (dominantCount > bestPoints.length && dominantCount >= 3) {
+      bestEr = er;
+      bestPoints = comps;
     }
   }
-  // 最初のピーク (線) を見つけて、その後の谷を閾値に
-  let peak1 = 1;
-  for (let i = 2; i < 8; i++) if (runHist[i] > runHist[peak1]) peak1 = i;
-  let valleyIdx = peak1 + 1, valleyVal = runHist[peak1 + 1] || 0;
-  for (let i = peak1 + 2; i < 15; i++) {
-    if (runHist[i] < valleyVal) { valleyVal = runHist[i]; valleyIdx = i; }
-    else if (runHist[i] > valleyVal * 1.3) break;
-  }
-  const runThresh = Math.max(4, valleyIdx + 1);
-  console.log('Run threshold (auto):', runThresh, 'peak1:', peak1, 'valley:', valleyIdx);
+  console.log('Best erosion:', bestEr, 'Components:', bestPoints.length);
 
-  // === 3b. 点のサイズ範囲も画像から推定 ===
-  // ラン長分布の peak1 (線の太さ) を基準に、点の直径は線の 2-6 倍と仮定
-  const dotMinSize = Math.max(5, peak1 * 2);
-  const dotMaxSize = Math.max(25, peak1 * 6);
-  console.log('Dot size:', dotMinSize, '-', dotMaxSize);
-
-  // 4. 縦に runThresh px 以上連続のみ残す (線除去)
-  const filt = new Uint8Array(W * H);
-  for (let x = 0; x < W; x++) {
-    let y = 0;
-    while (y < H) {
-      if (mask[y * W + x]) {
-        const start = y;
-        while (y < H && mask[y * W + x]) y++;
-        if (y - start >= runThresh) {
-          for (let yy = start; yy < y; yy++) filt[yy * W + x] = 1;
-        }
-      } else y++;
-    }
+  if (bestPoints.length < 2) {
+    throw new Error('点が見つかりませんでした (検出数: ' + bestPoints.length + ')。画像のトリミングを確認してください');
   }
 
-  // 5. 横に runThresh px 以上連続のみ残す (細い縦線除去)
-  const filt2 = new Uint8Array(W * H);
-  for (let y = 0; y < H; y++) {
-    let x = 0;
-    const off = y * W;
-    while (x < W) {
-      if (filt[off + x]) {
-        const start = x;
-        while (x < W && filt[off + x]) x++;
-        if (x - start >= runThresh) {
-          for (let xx = start; xx < x; xx++) filt2[off + xx] = 1;
-        }
-      } else x++;
-    }
+  // === 4. erosion+dilation で点を元のサイズに戻して再抽出 ===
+  let finalMask;
+  if (bestEr === 0) {
+    finalMask = mask;
+  } else {
+    const eroded = erode(mask, W, H, bestEr);
+    finalMask = dilate(eroded, W, H, bestEr);
   }
+  const components = getSquareComponents(finalMask, W, H, 10);
 
-  // 4. 連結成分分析 (BFS)
-  const visited = new Uint8Array(W * H);
-  const queue = new Int32Array(W * H);
-  const components = [];
-
-  for (let sy = 0; sy < H; sy++) {
-    for (let sx = 0; sx < W; sx++) {
-      const sIdx = sy * W + sx;
-      if (!filt2[sIdx] || visited[sIdx]) continue;
-
-      let head = 0, tail = 0;
-      queue[tail++] = sIdx;
-      visited[sIdx] = 1;
-      let sumX = 0, sumY = 0, count = 0;
-      let minX = sx, maxX = sx, minY = sy, maxY = sy;
-
-      while (head < tail) {
-        const idx = queue[head++];
-        const x = idx % W;
-        const y = (idx - x) / W;
-        sumX += x; sumY += y; count++;
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-
-        if (x > 0 && filt2[idx-1] && !visited[idx-1]) { visited[idx-1] = 1; queue[tail++] = idx-1; }
-        if (x < W-1 && filt2[idx+1] && !visited[idx+1]) { visited[idx+1] = 1; queue[tail++] = idx+1; }
-        if (y > 0 && filt2[idx-W] && !visited[idx-W]) { visited[idx-W] = 1; queue[tail++] = idx-W; }
-        if (y < H-1 && filt2[idx+W] && !visited[idx+W]) { visited[idx+W] = 1; queue[tail++] = idx+W; }
-      }
-
-      components.push({
-        cx: sumX / count, cy: sumY / count,
-        count,
-        w: maxX - minX + 1, h: maxY - minY + 1,
-      });
-    }
+  // === 5. サイズが揃っているもの (中央値の ±50%) を選択 ===
+  if (components.length === 0) {
+    throw new Error('点が見つかりませんでした');
   }
+  const sortedCounts = components.map(c => c.count).sort((a, b) => a - b);
+  const medianCount = sortedCounts[Math.floor(sortedCounts.length / 2)];
+  const points = components
+    .filter(c => c.count >= medianCount * 0.5 && c.count <= medianCount * 2.0)
+    .map(c => ({ x: c.cx, y: c.cy }));
 
-  // 7. 「点」だけ抽出 (画像サイズに応じた動的フィルタ)
-  const minCount = Math.max(20, Math.floor(dotMinSize * dotMinSize * 0.5));
-  const maxCount = Math.max(100, Math.floor(dotMaxSize * dotMaxSize * 1.2));
-  const points = components.filter(c =>
-    c.w >= dotMinSize && c.w <= dotMaxSize &&
-    c.h >= dotMinSize && c.h <= dotMaxSize &&
-    c.count >= minCount && c.count <= maxCount
-  ).map(c => ({ x: c.cx, y: c.cy }));
-  console.log('Components:', components.length, '→ Points:', points.length);
+  console.log('Final points:', points.length, '(from', components.length, 'components)');
 
   if (points.length < 2) {
-    throw new Error('点が見つかりませんでした (検出数: ' + points.length + ')。画像のトリミングを確認してください');
+    throw new Error('点が見つかりませんでした (検出数: ' + points.length + ')');
   }
 
   points.sort((a, b) => a.x - b.x);
@@ -336,6 +264,144 @@ function extractPoints(topValue, bottomValue, pointCount, intervalWidth) {
     end: (i + 1) * intervalWidth,
     sec: yToValue(p.y),
   }));
+}
+
+// === Helper Functions for Erosion/Dilation ===
+function sumMask(m) {
+  let s = 0;
+  for (let i = 0; i < m.length; i++) s += m[i];
+  return s;
+}
+
+/**
+ * erosion: 構造要素は (2r+1) x (2r+1) の正方形
+ * 入力画素の (2r+1)^2 近傍が全て 1 のときだけ出力 1
+ */
+function erode(mask, W, H, r) {
+  // 効率化: 縦方向のerosion → 横方向のerosionに分解 (separable)
+  const tmp = new Uint8Array(W * H);
+  // 縦
+  for (let x = 0; x < W; x++) {
+    for (let y = 0; y < H; y++) {
+      let allOne = 1;
+      for (let dy = -r; dy <= r; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= H || !mask[yy * W + x]) { allOne = 0; break; }
+      }
+      tmp[y * W + x] = allOne;
+    }
+  }
+  // 横
+  const out = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) {
+    const off = y * W;
+    for (let x = 0; x < W; x++) {
+      let allOne = 1;
+      for (let dx = -r; dx <= r; dx++) {
+        const xx = x + dx;
+        if (xx < 0 || xx >= W || !tmp[off + xx]) { allOne = 0; break; }
+      }
+      out[off + x] = allOne;
+    }
+  }
+  return out;
+}
+
+/**
+ * dilation: 構造要素の近傍に1があれば1
+ */
+function dilate(mask, W, H, r) {
+  const tmp = new Uint8Array(W * H);
+  // 縦
+  for (let x = 0; x < W; x++) {
+    for (let y = 0; y < H; y++) {
+      let any = 0;
+      for (let dy = -r; dy <= r; dy++) {
+        const yy = y + dy;
+        if (yy >= 0 && yy < H && mask[yy * W + x]) { any = 1; break; }
+      }
+      tmp[y * W + x] = any;
+    }
+  }
+  // 横
+  const out = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) {
+    const off = y * W;
+    for (let x = 0; x < W; x++) {
+      let any = 0;
+      for (let dx = -r; dx <= r; dx++) {
+        const xx = x + dx;
+        if (xx >= 0 && xx < W && tmp[off + xx]) { any = 1; break; }
+      }
+      out[off + x] = any;
+    }
+  }
+  return out;
+}
+
+/**
+ * 連結成分から「正方形に近い」(アスペクト比 0.5-2.0) のもののみを返す
+ */
+function getSquareComponents(mask, W, H, minSize) {
+  const visited = new Uint8Array(W * H);
+  const queue = new Int32Array(W * H);
+  const comps = [];
+
+  for (let sy = 0; sy < H; sy++) {
+    for (let sx = 0; sx < W; sx++) {
+      const sIdx = sy * W + sx;
+      if (!mask[sIdx] || visited[sIdx]) continue;
+
+      let head = 0, tail = 0;
+      queue[tail++] = sIdx;
+      visited[sIdx] = 1;
+      let sumX = 0, sumY = 0, count = 0;
+      let minX = sx, maxX = sx, minY = sy, maxY = sy;
+
+      while (head < tail) {
+        const idx = queue[head++];
+        const x = idx % W;
+        const y = (idx - x) / W;
+        sumX += x; sumY += y; count++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+
+        if (x > 0 && mask[idx-1] && !visited[idx-1]) { visited[idx-1] = 1; queue[tail++] = idx-1; }
+        if (x < W-1 && mask[idx+1] && !visited[idx+1]) { visited[idx+1] = 1; queue[tail++] = idx+1; }
+        if (y > 0 && mask[idx-W] && !visited[idx-W]) { visited[idx-W] = 1; queue[tail++] = idx-W; }
+        if (y < H-1 && mask[idx+W] && !visited[idx+W]) { visited[idx+W] = 1; queue[tail++] = idx+W; }
+      }
+
+      if (count < minSize) continue;
+      const w = maxX - minX + 1;
+      const h = maxY - minY + 1;
+      const aspect = w / Math.max(h, 1);
+      if (aspect < 0.5 || aspect > 2.0) continue;
+      comps.push({ cx: sumX / count, cy: sumY / count, w, h, count });
+    }
+  }
+  return comps;
+}
+
+/**
+ * 成分のサイズの中で「最頻クラスタ」のサイズを返す
+ * (各成分のcountに対して、その±30%以内に何個成分があるかをカウントし、最大値を返す)
+ */
+function countDominantSizeGroup(comps) {
+  if (comps.length < 3) return 0;
+  let best = 0;
+  for (const c of comps) {
+    const lo = c.count * 0.7;
+    const hi = c.count * 1.3;
+    let n = 0;
+    for (const c2 of comps) {
+      if (c2.count >= lo && c2.count <= hi) n++;
+    }
+    if (n > best) best = n;
+  }
+  return best;
 }
 
 // =========== 結果描画 ===========
